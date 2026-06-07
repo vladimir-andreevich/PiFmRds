@@ -98,6 +98,7 @@
 #include <stdint.h>
 #include <math.h>
 #include <time.h>
+#include <limits.h>
 #include <signal.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -107,6 +108,7 @@
 
 #include "rds.h"
 #include "fm_mpx.h"
+#include "nbfm.h"
 #include "control_pipe.h"
 
 #include "mailbox.h"
@@ -182,6 +184,12 @@
 #define GPCLK_CNTL        (0x70/4)
 #define GPCLK_DIV        (0x74/4)
 
+#define CM_PASSWORD        (0x5A << 24)
+#define CM_CTL_MASH_1      (1 << 9)
+#define CM_CTL_BUSY        (1 << 7)
+#define CM_CTL_ENAB        (1 << 4)
+#define CM_SRC_PLLD        6
+
 #define PWMCTL_MODE1        (1<<1)
 #define PWMCTL_PWEN1        (1<<0)
 #define PWMCTL_CLRF        (1<<6)
@@ -194,9 +202,20 @@
 
 #define GPFSEL0            (0x00/4)
 
-// The deviation specifies how wide the signal is. Use 25.0 for WBFM
-// (broadcast radio) and about 3.5 for NBFM (walkie-talkie style radio)
-#define DEVIATION        25.0
+// The deviation specifies how wide the signal is.
+#define WBFM_DEVIATION        25.0
+#define NBFM_DEVIATION        3.5
+
+#define FM_MIN_FREQ        76000000
+#define FM_MAX_FREQ        108000000
+#define NOAA_MIN_FREQ      162400000
+#define NOAA_MAX_FREQ      162550000
+
+
+typedef enum {
+    MODULATION_MODE_WBFM,
+    MODULATION_MODE_NBFM
+} modulation_mode_t;
 
 
 typedef struct {
@@ -220,6 +239,10 @@ static volatile uint32_t *pwm_reg;
 static volatile uint32_t *clk_reg;
 static volatile uint32_t *dma_reg;
 static volatile uint32_t *gpio_reg;
+static int (*baseband_close)(void) = NULL;
+static int debug_enabled = 0;
+
+#define DBG(...) do { if(debug_enabled) fprintf(stderr, __VA_ARGS__); } while(0)
 
 struct control_data_s {
     dma_cb_t cb[NUM_CBS];
@@ -232,6 +255,41 @@ struct control_data_s {
 
 static struct control_data_s *ctl;
 
+
+
+static void debug_dump_registers(const char *stage) {
+    if(!debug_enabled) return;
+
+    fprintf(stderr,
+            "[debug] %s: dma_cs=0x%08x dma_conblk_ad=0x%08x dma_debug=0x%08x "
+            "pwm_ctl=0x%08x pwm_dmac=0x%08x "
+            "gpclk_cntl=0x%08x gpclk_div=0x%08x "
+            "pwmclk_cntl=0x%08x pwmclk_div=0x%08x\n",
+            stage,
+            dma_reg ? dma_reg[DMA_CS] : 0,
+            dma_reg ? dma_reg[DMA_CONBLK_AD] : 0,
+            dma_reg ? dma_reg[DMA_DEBUG] : 0,
+            pwm_reg ? pwm_reg[PWM_CTL] : 0,
+            pwm_reg ? pwm_reg[PWM_DMAC] : 0,
+            clk_reg ? clk_reg[GPCLK_CNTL] : 0,
+            clk_reg ? clk_reg[GPCLK_DIV] : 0,
+            clk_reg ? clk_reg[PWMCLK_CNTL] : 0,
+            clk_reg ? clk_reg[PWMCLK_DIV] : 0);
+}
+
+
+
+static void debug_startup_probe(void) {
+    if(!debug_enabled) return;
+
+    for(int i = 0; i < 15; i++) {
+        usleep(10000);
+        debug_dump_registers("startup probe");
+    }
+}
+
+
+
 static void
 udelay(int us)
 {
@@ -240,24 +298,82 @@ udelay(int us)
     nanosleep(&ts, NULL);
 }
 
+
+
+static int wait_clock_busy(uint32_t clock_ctl_index, int busy) {
+    for(int i = 0; i < 10000; i++) {
+        int is_busy = (clk_reg[clock_ctl_index] & CM_CTL_BUSY) != 0;
+
+        if(is_busy == busy) return 0;
+
+        udelay(1);
+    }
+
+    return -1;
+}
+
+
+
+static void stop_clock(uint32_t clock_ctl_index) {
+    clk_reg[clock_ctl_index] = CM_PASSWORD | CM_SRC_PLLD;
+    if(wait_clock_busy(clock_ctl_index, 0) < 0) {
+        printf("Warning: clock %u did not stop cleanly.\n", clock_ctl_index);
+    }
+}
+
+
+
+static void start_clock(uint32_t clock_ctl_index) {
+    clk_reg[clock_ctl_index] = CM_PASSWORD | CM_CTL_MASH_1 | CM_CTL_ENAB | CM_SRC_PLLD;
+    if(wait_clock_busy(clock_ctl_index, 1) < 0) {
+        printf("Warning: clock %u did not start cleanly.\n", clock_ctl_index);
+    }
+}
+
+
+
 static void
 terminate(int num)
 {
+    DBG("[debug] terminate entry: num=%d\n", num);
+    debug_dump_registers("terminate entry");
+
     // Stop outputting and generating the clock.
-    if (clk_reg && gpio_reg && mbox.virt_addr) {
+    if (clk_reg && gpio_reg) {
         // Set GPIO4 to be an output (instead of ALT FUNC 0, which is the clock).
         gpio_reg[GPFSEL0] = (gpio_reg[GPFSEL0] & ~(7 << 12)) | (1 << 12);
 
         // Disable the clock generator.
-        clk_reg[GPCLK_CNTL] = 0x5A;
+        stop_clock(GPCLK_CNTL);
+        debug_dump_registers("after GPCLK stop");
     }
 
-    if (dma_reg && mbox.virt_addr) {
+    if (dma_reg) {
         dma_reg[DMA_CS] = BCM2708_DMA_RESET;
         udelay(10);
+        debug_dump_registers("after DMA reset");
     }
 
-    fm_mpx_close();
+    if (pwm_reg && clk_reg) {
+        pwm_reg[PWM_CTL] = 0;
+        udelay(10);
+        pwm_reg[PWM_DMAC] = 0;
+        udelay(10);
+        pwm_reg[PWM_CTL] = PWMCTL_CLRF;
+        udelay(10);
+        stop_clock(PWMCLK_CNTL);
+        udelay(10);
+        debug_dump_registers("after PWM/PWMCLK reset");
+    }
+
+    // TODO: A later startup experiment may explicitly stop PWM/PWMCLK here.
+    debug_dump_registers("before baseband/control cleanup");
+
+    if(baseband_close != NULL) {
+        baseband_close();
+        baseband_close = NULL;
+    }
+
     close_control_pipe();
 
     if (mbox.virt_addr != NULL) {
@@ -269,6 +385,20 @@ terminate(int num)
     printf("Terminating: cleanly deactivated the DMA engine and killed the carrier.\n");
 
     exit(num);
+}
+
+
+
+
+static int is_fm_freq(uint32_t carrier_freq) {
+    return carrier_freq >= FM_MIN_FREQ && carrier_freq <= FM_MAX_FREQ;
+}
+
+
+
+
+static int is_noaa_freq(uint32_t carrier_freq) {
+    return carrier_freq >= NOAA_MIN_FREQ && carrier_freq <= NOAA_MAX_FREQ;
 }
 
 static void
@@ -318,7 +448,21 @@ map_peripheral(uint32_t base, uint32_t len)
 #define DATA_SIZE 5000
 
 
-int tx(uint32_t carrier_freq, char *audio_file, uint16_t pi, char *ps, char *rt, float ppm, char *control_pipe) {
+int tx(uint32_t carrier_freq, char *audio_file, uint16_t pi, char *ps, char *rt, float ppm, char *control_pipe, modulation_mode_t modulation_mode) {
+    int (*baseband_open)(char *, size_t) = fm_mpx_open;
+    int (*baseband_get_samples)(float *) = fm_mpx_get_samples;
+    float deviation = WBFM_DEVIATION;
+
+    if(modulation_mode == MODULATION_MODE_NBFM) {
+        baseband_open = nbfm_open;
+        baseband_get_samples = nbfm_get_samples;
+        baseband_close = nbfm_close;
+        deviation = NBFM_DEVIATION;
+        control_pipe = NULL;
+    } else {
+        baseband_close = fm_mpx_close;
+    }
+
     // Catch all signals possible - it is vital we kill the DMA engine
     // on process exit!
     for (int i = 0; i < 64; i++) {
@@ -333,6 +477,27 @@ int tx(uint32_t carrier_freq, char *audio_file, uint16_t pi, char *ps, char *rt,
     pwm_reg = map_peripheral(PWM_VIRT_BASE, PWM_LEN);
     clk_reg = map_peripheral(CLK_VIRT_BASE, CLK_LEN);
     gpio_reg = map_peripheral(GPIO_VIRT_BASE, GPIO_LEN);
+    debug_dump_registers("after peripheral mmap/register setup");
+
+    // Force clean peripheral state before configuring RF output.
+    debug_dump_registers("Force cleaning peripheral state before configuring RF output...");
+    dma_reg[DMA_CS] = BCM2708_DMA_RESET;
+    udelay(100);
+    pwm_reg[PWM_CTL] = 0;
+    udelay(100);
+    pwm_reg[PWM_DMAC] = 0;
+    udelay(100);
+    pwm_reg[PWM_CTL] = PWMCTL_CLRF;
+    udelay(100);
+    stop_clock(PWMCLK_CNTL);
+    udelay(100);
+    stop_clock(GPCLK_CNTL);
+    udelay(100);
+    debug_dump_registers("after forced peripheral cleanup"); 
+
+    // Calculate the frequency control word.
+    // The fractional part is stored in the lower 12 bits.
+    uint32_t freq_ctl = ((float)(PLLFREQ / carrier_freq)) * (1 << 12);
 
     // Use the mailbox interface to the VC to ask for physical memory.
     mbox.handle = mbox_open();
@@ -352,26 +517,25 @@ int tx(uint32_t carrier_freq, char *audio_file, uint16_t pi, char *ps, char *rt,
         fatal("Could not map memory.\n");
     }
     printf("virt_addr = %p\n", mbox.virt_addr);
+    debug_dump_registers("after mailbox memory setup");
 
 
     // GPIO4 needs to be ALT FUNC 0 to output the clock
     gpio_reg[GPFSEL0] = (gpio_reg[GPFSEL0] & ~(7 << 12)) | (4 << 12);
+    debug_dump_registers("after GPIO4 ALT0 setup");
 
     // Program GPCLK to use MASH setting 1, so fractional dividers work
-    clk_reg[GPCLK_CNTL] = 0x5A << 24 | 6;
+    debug_dump_registers("before GPCLK stop/start");
+    stop_clock(GPCLK_CNTL);
+    clk_reg[GPCLK_DIV] = CM_PASSWORD | freq_ctl;
     udelay(100);
-    clk_reg[GPCLK_CNTL] = 0x5A << 24 | 1 << 9 | 1 << 4 | 6;
+    start_clock(GPCLK_CNTL);
+    debug_dump_registers("after GPCLK carrier start");
 
     ctl = (struct control_data_s *) mbox.virt_addr;
     dma_cb_t *cbp = ctl->cb;
     uint32_t phys_sample_dst = CM_GP0DIV;
     uint32_t phys_pwm_fifo_addr = PWM_PHYS_BASE + 0x18;
-
-
-    // Calculate the frequency control word
-    // The fractional part is stored in the lower 12 bits
-    uint32_t freq_ctl = ((float)(PLLFREQ / carrier_freq)) * ( 1 << 12 );
-
 
     for (int i = 0; i < NUM_SAMPLES; i++) {
         ctl->sample[i] = 0x5a << 24 | freq_ctl;    // Silence
@@ -394,6 +558,7 @@ int tx(uint32_t carrier_freq, char *audio_file, uint16_t pi, char *ps, char *rt,
     }
     cbp--;
     cbp->next = mem_virt_to_phys(mbox.virt_addr);
+    debug_dump_registers("after DMA control block build");
 
     // Here we define the rate at which we want to update the GPCLK control
     // register.
@@ -419,13 +584,11 @@ int tx(uint32_t carrier_freq, char *audio_file, uint16_t pi, char *ps, char *rt,
 
     pwm_reg[PWM_CTL] = 0;
     udelay(10);
-    clk_reg[PWMCLK_CNTL] = 0x5A000006;              // Source=PLLD and disable
-    udelay(100);
+    stop_clock(PWMCLK_CNTL);                        // Source=PLLD and disable
     // theorically : 1096 + 2012*2^-12
-    clk_reg[PWMCLK_DIV] = 0x5A000000 | (idivider<<12) | fdivider;
+    clk_reg[PWMCLK_DIV] = CM_PASSWORD | (idivider<<12) | fdivider;
     udelay(100);
-    clk_reg[PWMCLK_CNTL] = 0x5A000216;              // Source=PLLD and enable + MASH filter 1
-    udelay(100);
+    start_clock(PWMCLK_CNTL);                       // Source=PLLD and enable + MASH filter 1
     pwm_reg[PWM_RNG1] = 2;
     udelay(10);
     pwm_reg[PWM_DMAC] = PWMDMAC_ENAB | PWMDMAC_THRSHLD;
@@ -434,6 +597,7 @@ int tx(uint32_t carrier_freq, char *audio_file, uint16_t pi, char *ps, char *rt,
     udelay(10);
     pwm_reg[PWM_CTL] = PWMCTL_USEF1 | PWMCTL_PWEN1;
     udelay(10);
+    debug_dump_registers("after PWM clock/FIFO/DREQ setup");
 
 
     // Initialise the DMA
@@ -442,7 +606,10 @@ int tx(uint32_t carrier_freq, char *audio_file, uint16_t pi, char *ps, char *rt,
     dma_reg[DMA_CS] = BCM2708_DMA_INT | BCM2708_DMA_END;
     dma_reg[DMA_CONBLK_AD] = mem_virt_to_phys(ctl->cb);
     dma_reg[DMA_DEBUG] = 7; // clear debug error flags
+    debug_dump_registers("before DMA start");
     dma_reg[DMA_CS] = 0x10880001;    // go, mid priority, wait for outstanding writes
+    debug_dump_registers("after DMA start");
+    debug_startup_probe();
 
 
     size_t last_cb = (size_t)ctl->cb;
@@ -453,24 +620,31 @@ int tx(uint32_t carrier_freq, char *audio_file, uint16_t pi, char *ps, char *rt,
     int data_index = 0;
 
     // Initialize the baseband generator
-    if(fm_mpx_open(audio_file, DATA_SIZE) < 0) return 1;
+    debug_dump_registers("before baseband_open");
+    if(baseband_open(audio_file, DATA_SIZE) < 0) return 1;
+    debug_dump_registers("after baseband_open");
 
-    // Initialize the RDS modulator
     char myps[9] = {0};
-    set_rds_pi(pi);
-    set_rds_rt(rt);
     uint16_t count = 0;
     uint16_t count2 = 0;
     int varying_ps = 0;
 
-    if(ps) {
-        set_rds_ps(ps);
-        printf("PI: %04X, PS: \"%s\".\n", pi, ps);
+    if(modulation_mode == MODULATION_MODE_WBFM) {
+        // Initialize the RDS modulator
+        set_rds_pi(pi);
+        set_rds_rt(rt);
+
+        if(ps) {
+            set_rds_ps(ps);
+            printf("PI: %04X, PS: \"%s\".\n", pi, ps);
+        } else {
+            printf("PI: %04X, PS: <Varying>.\n", pi);
+            varying_ps = 1;
+        }
+        printf("RT: \"%s\"\n", rt);
     } else {
-        printf("PI: %04X, PS: <Varying>.\n", pi);
-        varying_ps = 1;
+        printf("NBFM mode: RDS, stereo pilot and control pipe are disabled.\n");
     }
-    printf("RT: \"%s\"\n", rt);
 
     // Initialize the control pipe reader
     if(control_pipe) {
@@ -485,9 +659,23 @@ int tx(uint32_t carrier_freq, char *audio_file, uint16_t pi, char *ps, char *rt,
     }
 
 
-    printf("Starting to transmit on %3.1f MHz.\n", carrier_freq/1e6);
+    printf("Starting to transmit on %3.3f MHz in %s mode, deviation %.1f kHz.\n",
+           carrier_freq/1e6,
+           modulation_mode == MODULATION_MODE_NBFM ? "NBFM" : "WBFM/RDS",
+           deviation);
+
+    unsigned long long loop_count = 0;
+    unsigned long long written_samples = 0;
+    unsigned long long dma_conblk_stalled_count = 0;
+    uint32_t previous_dma_conblk_ad = 0;
+    int intval_min = INT_MAX;
+    int intval_max = INT_MIN;
+    unsigned long long intval_nonzero_count = 0;
+    time_t last_debug_dump_time = time(NULL);
 
     for (;;) {
+        if(debug_enabled) loop_count++;
+
         // Default (varying) PS
         if(varying_ps) {
             if(count == 512) {
@@ -508,7 +696,13 @@ int tx(uint32_t carrier_freq, char *audio_file, uint16_t pi, char *ps, char *rt,
 
         usleep(5000);
 
-        size_t cur_cb = mem_phys_to_virt(dma_reg[DMA_CONBLK_AD]);
+        uint32_t current_dma_conblk_ad = dma_reg[DMA_CONBLK_AD];
+        if(debug_enabled && previous_dma_conblk_ad != 0 && current_dma_conblk_ad == previous_dma_conblk_ad) {
+            dma_conblk_stalled_count++;
+        }
+        if(debug_enabled) previous_dma_conblk_ad = current_dma_conblk_ad;
+
+        size_t cur_cb = mem_phys_to_virt(current_dma_conblk_ad);
         int last_sample = (last_cb - (size_t)mbox.virt_addr) / (sizeof(dma_cb_t) * 2);
         int this_sample = (cur_cb - (size_t)mbox.virt_addr) / (sizeof(dma_cb_t) * 2);
         int free_slots = this_sample - last_sample;
@@ -516,31 +710,106 @@ int tx(uint32_t carrier_freq, char *audio_file, uint16_t pi, char *ps, char *rt,
         if (free_slots < 0)
             free_slots += NUM_SAMPLES;
 
+        int free_slots_for_debug = free_slots;
+
         while (free_slots >= SUBSIZE) {
             // get more baseband samples if necessary
             if(data_len == 0) {
-                if( fm_mpx_get_samples(data) < 0 ) {
+                if(baseband_get_samples(data) < 0) {
                     terminate(0);
                 }
                 data_len = DATA_SIZE;
                 data_index = 0;
             }
 
-            float dval = data[data_index] * (DEVIATION / 10.);
+            float dval = data[data_index] * (deviation / 10.);
             data_index++;
             data_len--;
 
             int intval = (int)((floor)(dval));
             //int frac = (int)((dval - (float)intval) * SUBSIZE);
 
+            if(debug_enabled) {
+                if(intval < intval_min) intval_min = intval;
+                if(intval > intval_max) intval_max = intval;
+                if(intval != 0) intval_nonzero_count++;
+            }
 
             ctl->sample[last_sample++] = (0x5A << 24 | freq_ctl) + intval; //(frac > j ? intval + 1 : intval);
             if (last_sample == NUM_SAMPLES)
                 last_sample = 0;
 
             free_slots -= SUBSIZE;
+            if(debug_enabled) written_samples++;
         }
         last_cb = (size_t)(mbox.virt_addr + last_sample * sizeof(dma_cb_t) * 2);
+
+        if(debug_enabled) {
+            time_t now = time(NULL);
+
+            if(now != last_debug_dump_time) {
+                int dump_intval_min = intval_min == INT_MAX ? 0 : intval_min;
+                int dump_intval_max = intval_max == INT_MIN ? 0 : intval_max;
+
+                uint32_t gpclk_div_min = 0xffffffff;
+                uint32_t gpclk_div_max = 0;
+                uint32_t gpclk_div_last = 0;
+
+                for (int k = 0; k < 128; k++) {
+                    uint32_t div = ((volatile uint32_t *)clk_reg)[GPCLK_DIV];
+
+                    if (div < gpclk_div_min)
+                        gpclk_div_min = div;
+
+                    if (div > gpclk_div_max)
+                        gpclk_div_max = div;
+
+                    gpclk_div_last = div;
+                }
+
+                uint32_t gpfsel0 = ((volatile uint32_t *)gpio_reg)[GPFSEL0];
+                int gpio4_func = (gpfsel0 >> 12) & 7;
+
+                fprintf(stderr,
+                        "[debug] loop: loop_count=%llu dma_cs=0x%08x "
+                        "dma_conblk_ad=0x%08x dma_debug=0x%08x "
+                        "cur_cb=0x%zx this_sample=%d last_sample=%d "
+                        "free_slots=%d written_samples=%llu "
+                        "dma_conblk_stalled_count=%llu "
+                        "intval_min=%d intval_max=%d intval_nonzero_count=%llu "
+                        "gpclk_div_min=0x%08x gpclk_div_max=0x%08x gpclk_div_last=0x%08x "
+                        "gpfsel0=0x%08x gpio4_func=%d "
+                        "pwm_ctl=0x%08x pwm_dmac=0x%08x "
+                        "gpclk_cntl=0x%08x pwmclk_cntl=0x%08x\n",
+                        loop_count,
+                        dma_reg[DMA_CS],
+                        current_dma_conblk_ad,
+                        dma_reg[DMA_DEBUG],
+                        cur_cb,
+                        this_sample,
+                        last_sample,
+                        free_slots_for_debug,
+                        written_samples,
+                        dma_conblk_stalled_count,
+                        dump_intval_min,
+                        dump_intval_max,
+                        intval_nonzero_count,
+                        gpclk_div_min,
+                        gpclk_div_max,
+                        gpclk_div_last,
+                        gpfsel0,
+                        gpio4_func,
+                        pwm_reg[PWM_CTL],
+                        pwm_reg[PWM_DMAC],
+                        clk_reg[GPCLK_CNTL],
+                        clk_reg[PWMCLK_CNTL]);
+
+                intval_min = INT_MAX;
+                intval_max = INT_MIN;
+                intval_nonzero_count = 0;
+                last_debug_dump_time = now;
+            }
+        }
     }
 
     return 0;
@@ -551,6 +820,7 @@ int main(int argc, char **argv) {
     char *audio_file = NULL;
     char *control_pipe = NULL;
     uint32_t carrier_freq = 107900000;
+    modulation_mode_t modulation_mode = MODULATION_MODE_WBFM;
     char *ps = NULL;
     char *rt = "PiFmRds: live FM-RDS transmission from the RaspberryPi";
     uint16_t pi = 0x1234;
@@ -564,14 +834,21 @@ int main(int argc, char **argv) {
 
         if(arg[0] == '-' && i+1 < argc) param = argv[i+1];
 
-        if((strcmp("-wav", arg)==0 || strcmp("-audio", arg)==0) && param != NULL) {
+        if(strcmp("-debug", arg)==0) {
+            debug_enabled = 1;
+        } else if((strcmp("-wav", arg)==0 || strcmp("-audio", arg)==0) && param != NULL) {
             i++;
             audio_file = param;
         } else if(strcmp("-freq", arg)==0 && param != NULL) {
             i++;
-            carrier_freq = 1e6 * atof(param);
-            if(carrier_freq < 76e6 || carrier_freq > 108e6)
-                fatal("Incorrect frequency specification. Must be in megahertz, of the form 107.9, between 76 and 108.\n");
+            carrier_freq = (uint32_t)(1e6 * atof(param) + 0.5);
+            if(is_noaa_freq(carrier_freq)) {
+                modulation_mode = MODULATION_MODE_NBFM;
+            } else if(is_fm_freq(carrier_freq)) {
+                modulation_mode = MODULATION_MODE_WBFM;
+            } else {
+                fatal("Incorrect frequency specification. Must be in megahertz, of the form 107.9 between 76 and 108, or 162.4 between 162.40 and 162.55.\n");
+            }
         } else if(strcmp("-pi", arg)==0 && param != NULL) {
             i++;
             pi = (uint16_t) strtol(param, NULL, 16);
@@ -590,7 +867,7 @@ int main(int argc, char **argv) {
         } else {
             fatal("Unrecognised argument: %s.\n"
             "Syntax: pi_fm_rds [-freq freq] [-audio file] [-ppm ppm_error] [-pi pi_code]\n"
-            "                  [-ps ps_text] [-rt rt_text] [-ctl control_pipe]\n", arg);
+            "                  [-ps ps_text] [-rt rt_text] [-ctl control_pipe] [-debug]\n", arg);
         }
     }
 
@@ -599,7 +876,7 @@ int main(int argc, char **argv) {
     char* locale = setlocale(LC_ALL, "");
     printf("Locale set to %s.\n", locale);
 
-    int errcode = tx(carrier_freq, audio_file, pi, ps, rt, ppm, control_pipe);
+    int errcode = tx(carrier_freq, audio_file, pi, ps, rt, ppm, control_pipe, modulation_mode);
 
     terminate(errcode);
 }

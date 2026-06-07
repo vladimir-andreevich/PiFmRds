@@ -255,12 +255,14 @@ int fm_mpx_get_samples(float *mpx_buffer) {
 }
 
 
-int fm_mpx_close() {
-    if(sf_close(inf) ) {
+int fm_mpx_close(void) {
+    if(inf != NULL && sf_close(inf)) {
         fprintf(stderr, "Error closing audio file");
     }
     
     if(audio_buffer != NULL) free(audio_buffer);
+    audio_buffer = NULL;
+    inf = NULL;
     
     return 0;
 }

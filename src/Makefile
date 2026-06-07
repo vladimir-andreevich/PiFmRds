@@ -41,8 +41,8 @@ CFLAGS = $(STD_CFLAGS) $(ARCH_CFLAGS) -DRASPI=$(TARGET)
 
 ifneq ($(TARGET), other)
 
-app: rds.o waveforms.o pi_fm_rds.o rds_strings.o fm_mpx.o control_pipe.o mailbox.o
-	$(CC) $(LDFLAGS) -o pi_fm_rds rds.o rds_strings.o waveforms.o mailbox.o pi_fm_rds.o fm_mpx.o control_pipe.o -lsndfile -lm
+app: rds.o waveforms.o pi_fm_rds.o rds_strings.o fm_mpx.o nbfm.o control_pipe.o mailbox.o
+	$(CC) $(LDFLAGS) -o pi_fm_rds rds.o rds_strings.o waveforms.o mailbox.o pi_fm_rds.o fm_mpx.o nbfm.o control_pipe.o -lsndfile -lm
 
 endif
 
@@ -69,7 +69,7 @@ waveforms.o: waveforms.c waveforms.h
 mailbox.o: mailbox.c mailbox.h
 	$(CC) $(CFLAGS) mailbox.c
 
-pi_fm_rds.o: pi_fm_rds.c control_pipe.h fm_mpx.h rds.h mailbox.h
+pi_fm_rds.o: pi_fm_rds.c control_pipe.h fm_mpx.h nbfm.h rds.h mailbox.h
 	$(CC) $(CFLAGS) pi_fm_rds.c
 
 rds_wav.o: rds_wav.c
@@ -77,6 +77,9 @@ rds_wav.o: rds_wav.c
 
 fm_mpx.o: fm_mpx.c fm_mpx.h
 	$(CC) $(CFLAGS) fm_mpx.c
+
+nbfm.o: nbfm.c nbfm.h
+	$(CC) $(CFLAGS) nbfm.c
 
 clean:
 	rm -f *.o *_test
