@@ -151,8 +151,17 @@
 #define DMA_CONBLK_AD        (0x04/4)
 #define DMA_DEBUG        (0x20/4)
 
-#define DMA_BASE_OFFSET        0x00007000
-#define DMA_LEN            0x24
+#ifndef DMA_NUMBER
+#define DMA_NUMBER 0
+#endif
+
+#define DMA_CHANNEL_STRIDE 0x100
+#define DMA_REG_SIZE_BYTES 0x24
+#define DMA_LEN_FOR_CHANNEL(n) ((n) * DMA_CHANNEL_STRIDE + DMA_REG_SIZE_BYTES)
+
+#define DMA_BASE_OFFSET 0x00007000
+#define DMA_LEN DMA_LEN_FOR_CHANNEL(DMA_NUMBER)
+
 #define PWM_BASE_OFFSET        0x0020C000
 #define PWM_LEN            0x28
 #define CLK_BASE_OFFSET            0x00101000
@@ -474,9 +483,15 @@ int tx(uint32_t carrier_freq, char *audio_file, uint16_t pi, char *ps, char *rt,
     }
 
     dma_reg = map_peripheral(DMA_VIRT_BASE, DMA_LEN);
+    dma_reg += (DMA_NUMBER * DMA_CHANNEL_STRIDE) / sizeof(*dma_reg);
+
     pwm_reg = map_peripheral(PWM_VIRT_BASE, PWM_LEN);
     clk_reg = map_peripheral(CLK_VIRT_BASE, CLK_LEN);
     gpio_reg = map_peripheral(GPIO_VIRT_BASE, GPIO_LEN);
+
+    DBG("[debug] dma_number=%d dma_channel_stride=0x%x dma_len=0x%x\n",
+    DMA_NUMBER, DMA_CHANNEL_STRIDE, DMA_LEN);
+
     debug_dump_registers("after peripheral mmap/register setup");
 
     // Force clean peripheral state before configuring RF output.

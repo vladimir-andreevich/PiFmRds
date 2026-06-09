@@ -37,3 +37,26 @@ Interpretation guide:
 * If bad mode disappears after delays or reset-order changes, focus on startup
   sequencing and cleanup. The current cleanup logs GPCLK stop and DMA reset;
   PWM/PWMCLK stop is intentionally left as a follow-up experiment.
+
+## Selecting the DMA channel
+
+By default the transmitter uses the original PiFmRds DMA channel:
+
+    make clean
+    make CFLAGS_EXTRA="-DDMA_NUMBER=0"
+
+For Raspberry Pi 4, build-time DMA channel selection can be used to test whether the bad RF state is related to DMA channel arbitration or framebuffer/desktop activity:
+
+    make clean
+    make CFLAGS_EXTRA="-DDMA_NUMBER=5"
+
+or:
+
+    make clean
+    make CFLAGS_EXTRA="-DDMA_NUMBER=6"
+
+When `-debug` is enabled, the selected DMA channel is printed at startup:
+
+    [debug] dma_number=5 dma_channel_stride=0x100 dma_len=0x524
+
+Always run `make clean` before changing `DMA_NUMBER`, otherwise an old `pi_fm_rds.o` may be reused.
