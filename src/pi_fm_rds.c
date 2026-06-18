@@ -1,5 +1,6 @@
 /*
  * PiFmRds - FM/RDS transmitter for the Raspberry Pi
+ * Copyright (C) 2026 Volodymyr Halchenko
  * Copyright (C) 2014, 2015 Christophe Jacquet, F8FTK
  * Copyright (C) 2012, 2015 Richard Hirst
  * Copyright (C) 2012 Oliver Mattos and Oskar Weigl
@@ -136,6 +137,9 @@
 #error Unknown Raspberry Pi version (variable RASPI)
 #endif
 
+#define MAX_CPU_GOVERNORS 32
+#define GOVERNOR_NAME_LEN 32
+
 #define NUM_SAMPLES        50000
 #define NUM_CBS            (NUM_SAMPLES * 2)
 
@@ -232,6 +236,18 @@ typedef struct {
          stride, next, pad[2];
 } dma_cb_t;
 
+
+typedef struct {
+    char path[128];
+    char old_governor[GOVERNOR_NAME_LEN];
+} governor_backup_t;
+
+
+static governor_backup_t governor_backup[MAX_CPU_GOVERNORS];
+static int governor_backup_count = 0;
+static int governor_performance_active = 0;
+static int performance_governor_enabled = 1;
+
 #define BUS_TO_PHYS(x) ((x)&~0xC0000000)
 
 
@@ -263,6 +279,122 @@ struct control_data_s {
 #define NUM_PAGES    ((sizeof(struct control_data_s) + PAGE_SIZE - 1) >> PAGE_SHIFT)
 
 static struct control_data_s *ctl;
+
+
+
+/* Read the current status of the CPU core governor. */
+static int read_governor(const char *path, char *buf, size_t buf_len) {
+    FILE *file = fopen(path, "r");
+    if(!file) {
+        return -1;
+    }
+
+    if(!fgets(buf, buf_len, file)) {
+        fclose(file);
+        return -1;
+    }
+
+    fclose(file);
+
+    buf[strcspn(buf, "\r\n")] = '\0';
+    return 0;
+}
+
+
+
+/* Write a new CPU core governor. 
+ * Writing a new value changes the governor immediately. */
+static int write_governor(const char *path, const char *value) {
+    FILE *file = fopen(path, "w");
+    if(!file) {
+        return -1;
+    }
+
+    if(fprintf(file, "%s\n", value) < 0) {
+        fclose(file);
+        return -1;
+    }
+
+    if(fclose(file) != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+
+
+/* Restore CPU governors which were present on the cores
+ * before the start of PiFmRDS. */
+static void restore_governors(void) {
+    if(!governor_performance_active) {
+        return;
+    }
+
+    for(int i = 0; i < governor_backup_count; i++) {
+        if(write_governor(governor_backup[i].path,
+                          governor_backup[i].old_governor) != 0) {
+            fprintf(stderr, "Warning: failed to restore %s to %s: %s\n",
+                    governor_backup[i].path,
+                    governor_backup[i].old_governor,
+                    strerror(errno));
+        } else {
+            DBG("[debug] governor %s restored to %s\n",
+                governor_backup[i].path,
+                governor_backup[i].old_governor);
+        }
+    }
+
+    governor_performance_active = 0;
+}
+
+
+
+/* Set the performance governor to all CPU cores. */
+static int enable_performance_governor(void) {
+    if(governor_performance_active) {
+        return 0;
+    }
+    governor_backup_count = 0;
+
+    for(int cpu = 0; cpu < MAX_CPU_GOVERNORS; cpu++) {
+        char path[128];
+        char old_governor[GOVERNOR_NAME_LEN];
+
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_governor",
+                 cpu);
+
+        if(read_governor(path, old_governor, sizeof(old_governor)) != 0) {
+            continue;
+        }
+
+        snprintf(governor_backup[governor_backup_count].path,
+                 sizeof(governor_backup[governor_backup_count].path),
+                 "%s", path);
+
+        snprintf(governor_backup[governor_backup_count].old_governor,
+                 sizeof(governor_backup[governor_backup_count].old_governor),
+                 "%s", old_governor);
+
+        governor_backup_count++;
+
+        if(write_governor(path, "performance") != 0) {
+            fprintf(stderr, "Warning: failed to set %s to performance: %s\n",
+                    path, strerror(errno));
+        } else {
+            DBG("[debug] governor %s: %s -> performance\n", path, old_governor);
+        }
+    }
+
+    if(governor_backup_count == 0) {
+        fprintf(stderr, "Warning: no CPU governor files found.\n");
+        return -1;
+    }
+
+    governor_performance_active = 1;
+    return 0;
+}
 
 
 
@@ -391,6 +523,8 @@ terminate(int num)
         mem_free(mbox.handle, mbox.mem_ref);
     }
 
+    restore_governors();
+
     printf("Terminating: cleanly deactivated the DMA engine and killed the carrier.\n");
 
     exit(num);
@@ -480,6 +614,12 @@ int tx(uint32_t carrier_freq, char *audio_file, uint16_t pi, char *ps, char *rt,
         memset(&sa, 0, sizeof(sa));
         sa.sa_handler = terminate;
         sigaction(i, &sa, NULL);
+    }
+
+    if(performance_governor_enabled) {
+        if(enable_performance_governor() != 0) {
+            fprintf(stderr, "Warning: performance governor failed or is unavailable.\n");
+        }
     }
 
     dma_reg = map_peripheral(DMA_VIRT_BASE, DMA_LEN);
@@ -879,10 +1019,13 @@ int main(int argc, char **argv) {
         } else if(strcmp("-ctl", arg)==0 && param != NULL) {
             i++;
             control_pipe = param;
+        } else if(strcmp("-no-performance-governor", arg)==0) {
+            performance_governor_enabled = 0;
         } else {
             fatal("Unrecognised argument: %s.\n"
             "Syntax: pi_fm_rds [-freq freq] [-audio file] [-ppm ppm_error] [-pi pi_code]\n"
-            "                  [-ps ps_text] [-rt rt_text] [-ctl control_pipe] [-debug]\n", arg);
+            "                  [-ps ps_text] [-rt rt_text] [-ctl control_pipe]\n"
+            "                  [-debug] [-no-performance-governor]\n");
         }
     }
 
