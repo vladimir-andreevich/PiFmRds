@@ -6,6 +6,8 @@ Pi-FM-RDS
 
 This program generates an FM modulation, with RDS (Radio Data System) data generated in real time. It can include monophonic or stereophonic audio.
 
+This fork brings PiFmRds up to date with **reliable Raspberry Pi 4 support** and adds **narrow-band FM (NBFM) transmission in the 162.40–162.55 MHz band**.
+
 It is based on the FM transmitter created by Oliver Mattos and Oskar Weigl, and later adapted to using DMA by [Richard Hirst](https://github.com/richardghirst). Christophe Jacquet adapted it and added the RDS data generator and modulator. The transmitter uses the Raspberry Pi's PWM generator to produce VHF signals.
 
 It has been verified to be compatible with Raspberry Pi models 1, 2, 3, 4, Zero and Zero 2.
@@ -29,7 +31,7 @@ These should be the complete instructions assuming a clean Raspberry Pi OS Lite 
 
 ```bash
 sudo apt install git libsndfile1-dev
-git clone https://github.com/ChristopheJacquet/PiFmRds.git
+git clone https://github.com/vladimir-andreevich/PiFmRds.git
 cd PiFmRds/src
 make clean
 make
@@ -57,18 +59,20 @@ To test stereophonic audio, you can try the file `stereo_44100.wav` provided.
 The more general syntax for running Pi-FM-RDS is as follows:
 
 ```
-pi_fm_rds [-freq freq] [-audio file] [-ppm ppm_error] [-pi pi_code] [-ps ps_text] [-rt rt_text]
+pi_fm_rds [-freq freq] [-audio file] [-ppm ppm_error] [-pi pi_code] [-ps ps_text] [-rt rt_text] [-ctl control_pipe] [-debug] [-no-performance-governor]
 ```
 
 All arguments are optional:
 
-* `-freq` specifies the carrier frequency (in MHz). Example: `-freq 107.9`. Frequencies from 162.40 to 162.55 MHz automatically use the narrow-band FM path without RDS or stereo multiplex. Example: `-freq 162.4`.
+* `-freq` specifies the carrier frequency in MHz. Frequencies from 76 to 108 MHz use the standard wide-band FM path. Example: `-freq 107.9`. Frequencies from 162.40 to 162.55 MHz automatically use the narrow-band FM path. NBFM uses a separate monophonic baseband generator with audio low-pass filtered to approximately 3.5 kHz. Multi-channel input is mixed down to mono, and the FM stereo multiplex, stereo pilot and RDS subcarrier are not generated. Example: `-freq 162.4`.
 * `-audio` specifies an audio file to play as audio. The sample rate does not matter: Pi-FM-RDS will resample and filter it. If a stereo file is provided, Pi-FM-RDS will produce an FM-Stereo signal. Example: `-audio sound.wav`. The supported formats depend on `libsndfile`. This includes WAV and Ogg/Vorbis (among others) but not MP3. Specify `-` as the file name to read audio data on standard input (useful for piping audio into Pi-FM-RDS, see below).
 * `-pi` specifies the PI-code of the RDS broadcast. 4 hexadecimal digits. Example: `-pi FFFF`.
 * `-ps` specifies the station name (Program Service name, PS) of the RDS broadcast. Limit: 8 characters. Example: `-ps RASP-PI`.
 * `-rt` specifies the radiotext (RT) to be transmitted. Limit: 64 characters. Example: `-rt 'Hello, world!'`.
 * `-ctl` specifies a named pipe (FIFO) to use as a control channel to change PS and RT at run-time (see below).
 * `-ppm` specifies your Raspberry Pi's oscillator error in parts per million (ppm), see below.
+* `-debug` enables detailed RF runtime diagnostics. It logs DMA, PWM, clock and GPIO state during startup and shutdown, performs a short DMA startup probe, and periodically reports DMA progress, stalls, modulation activity and clock state during transmission.
+* `-no-performance-governor` disables the automatic CPU performance governor used during transmission. By default, Pi-FM-RDS temporarily switches available CPU cores to the performance governor to avoid RF degradation caused by sensitivity to dynamic voltage and frequency scaling.
 
 By default the PS changes back and forth between `Pi-FmRds` and a sequence number, starting at `00000000`. The PS changes around one time per second.
 
